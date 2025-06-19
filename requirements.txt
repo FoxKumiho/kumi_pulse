@@ -1,0 +1,42 @@
+# Основное
+fastapi
+uvicorn[standard]
+pydantic
+
+# Телеграм-бот
+aiogram
+python-dotenv
+
+# База данных
+psycopg2-binary
+SQLAlchemy
+alembic
+mysql-connector-python
+
+
+# Redis
+redis
+aioredis
+
+# Админ-панель (Flask + Jinja2)
+Flask
+Jinja2
+Flask-Login
+Flask-WTF
+
+# Платёжные системы
+requests
+stripe
+paypalrestsdk
+
+# Безопасность
+PyJWT
+passlib[bcrypt]
+cryptography
+httpx
+
+# Вспомогательные
+python-multipart
+email-validator
+loguru
+pytest
