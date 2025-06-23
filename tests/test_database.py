@@ -1,3 +1,4 @@
+
 import pytest
 import asyncio
 from unittest.mock import AsyncMock, patch
@@ -5,47 +6,49 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 from backend.database import (
     Base, User, Server, PremiumUser, Localization, Story, CommandUsage, ServerAdmin,
-    init_db, get_session, get_or_create_user, get_or_create_server, check_premium_status,
+    init_db, get_or_create_user, get_or_create_server, check_premium_status,
     get_translation, create_story, register_command_usage, check_admin_status
 )
 from loguru import logger
+import pytest_asyncio
 
 # Настройка временной базы данных SQLite в памяти
 DATABASE_URL = "sqlite+aiosqlite:///:memory:"
-engine = create_async_engine(DATABASE_URL, echo=False)
-AsyncSessionFactory = async_sessionmaker(
-    bind=engine, class_=AsyncSession, expire_on_commit=False, autocommit=False, autoflush=False
+test_engine = create_async_engine(DATABASE_URL, echo=False)
+TestAsyncSessionFactory = async_sessionmaker(
+    bind=test_engine, class_=AsyncSession, expire_on_commit=False, autocommit=False, autoflush=False
 )
 
 # Настройка loguru для вывода логов
 logger.add("test.log", rotation="10 MB", level="INFO")
 
-@pytest.fixture(scope="session")
+@pytest_asyncio.fixture(scope="session")
 def event_loop():
     """Создаем event loop для асинхронных тестов."""
     loop = asyncio.get_event_loop_policy().new_event_loop()
     yield loop
     loop.close()
 
-@pytest.fixture(autouse=True)
+@pytest_asyncio.fixture(autouse=True)
 async def setup_database():
     """Инициализация базы данных SQLite в памяти."""
-    async with engine.begin() as conn:
+    async with test_engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     yield
-    async with engine.begin() as conn:
+    async with test_engine.begin() as conn:
         await conn.run_sync(Base.metadata.drop_all)
 
-@pytest.fixture
+@pytest_asyncio.fixture
 async def session():
-    """Фикстура для создания сессии."""
-    async with get_session() as session:
+    """Фикстура для создания сессии. Использует TestAsyncSessionFactory для SQLite."""
+    async with TestAsyncSessionFactory() as session:
         yield session
+        await session.rollback()
 
 @pytest.mark.asyncio
 async def test_init_db():
     """Тест инициализации базы данных."""
-    with patch("backend.database.engine", engine):
+    with patch("backend.database.engine", test_engine):
         await init_db()
     with open("test.log") as f:
         assert "База данных успешно инициализирована" in f.read()
