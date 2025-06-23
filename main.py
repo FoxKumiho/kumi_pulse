@@ -164,3 +164,5 @@ def quicksort(arr):
 print(quicksort([3,4,5,10,1,3,2,1]))
 
 print("привет")
+
+print("привет")
