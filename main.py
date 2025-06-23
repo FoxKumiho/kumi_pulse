@@ -162,3 +162,5 @@ def quicksort(arr):
     return quicksort(left) + middle + quicksort(right)
 
 print(quicksort([3,4,5,10,1,3,2,1]))
+
+print("привет")
