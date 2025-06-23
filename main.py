@@ -151,3 +151,14 @@ for person in people:
 
     print(f"{person['name']} ({person['age']} лет) - Профессия: {player.profession}, "
           f"Опыт: {player.exp}, Уровень: {player.level}, HP: {hp}, Золото: {gold_earned}, Статус: {status}")
+
+def quicksort(arr):
+    if len(arr) <= 1:
+        return arr
+    pivot = arr[len(arr) // 2]
+    left = [x for x in arr if x < pivot]
+    middle = [x for x in arr if x == pivot]
+    right = [x for  x in arr if x > pivot]
+    return quicksort(left) + middle + quicksort(right)
+
+print(quicksort([3,4,5,10,1,3,2,1]))
