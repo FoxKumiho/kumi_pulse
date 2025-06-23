@@ -331,8 +331,10 @@ async def register_command_usage(
         logger.error(f"Ошибка в register_command_usage для user_id {user_id}, команды {command_name}: {e}")
         raise
 
-async def check_admin_status(session: AsyncSession, user_id: int, server_id: int) -> Optional[ServerAdmin]:
-    """Проверить, является ли пользователь администратором сервера."""
+async def check_admin_status(
+    session: AsyncSession, user_id: int, server_id: int
+) -> Optional[ServerAdmin]:
+    """Проверить статус администратора."""
     try:
         result = await session.execute(
             select(ServerAdmin).filter_by(user_id=user_id, server_id=server_id)
