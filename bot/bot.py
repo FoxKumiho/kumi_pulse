@@ -1,101 +1,106 @@
-import asyncio
-import importlib
-import logging
+#
+# kumi_pulse/bot/bot.py
+#
+import os
 import sys
-import traceback
-
-from os import getenv
-from pathlib import Path
-
-from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
+import importlib
+import asyncio
+from aiogram import Bot, Dispatcher
 from dotenv import load_dotenv
+from loguru import logger
+from contextlib import asynccontextmanager
 
-from aiogram import Bot, Dispatcher, html
-from aiogram.filters import CommandStart, Command
-from aiogram.types import Message
+# === ПОДГОТОВКА ПУТЕЙ ===
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, project_root)
+logger.debug(f"Project root added to sys.path: {project_root}")
+logger.debug(f"Current sys.path: {sys.path}")
 
-from handlers.echo import router as echo_router
+# === ИМПОРТ БАЗЫ ДАННЫХ ===
+backend_path = os.path.join(project_root, 'backend', 'database.py')
+if not os.path.exists(backend_path):
+    logger.error(f"File {backend_path} does not exist")
+    raise FileNotFoundError(f"File {backend_path} does not exist")
+else:
+    logger.debug(f"File {backend_path} found")
 
+try:
+    from backend.database import init_db
+    logger.debug("Successfully imported backend.database")
+except ModuleNotFoundError as e:
+    logger.error(f"Failed to import backend.database: {e}")
+    raise
 
-env_path = Path(__file__).resolve().parent.parent / "config" / ".env"
+# === ЗАГРУЗКА ПЕРЕМЕННЫХ ОКРУЖЕНИЯ ===
+load_dotenv(dotenv_path=os.path.join(project_root, 'config', '.env'))
 
-# Загрузить переменные окружения из файла .env
-load_dotenv(dotenv_path=env_path)
+# === НАСТРОЙКА ЛОГИРОВАНИЯ ===
+logger.add("app.log", rotation="10 MB", level="DEBUG", format="{time} {level} {message}")
 
-TOKEN = getenv("TOKEN")
+# === ИНИЦИАЛИЗАЦИЯ БОТА ===
+BOT_TOKEN = os.getenv('BOT_TOKEN')
+if not BOT_TOKEN:
+    logger.error("BOT_TOKEN not found in environment variables")
+    raise ValueError("BOT_TOKEN not found in environment variables")
 
-# Проверяем, что токен загрузился
-if not TOKEN:
-    raise ValueError("Не найден токен")
+bot = Bot(token=BOT_TOKEN)
 
-# Все обработчики должны быть прикреплены к маршрутизатору (или Dispatcher)
-dp = Dispatcher()
+# === РЕГИСТРАЦИЯ ОБРАБОТЧИКОВ ===
+def register_handlers(dp: Dispatcher) -> None:
+    print("🔥 register_handlers() is called")
+    handlers_dir = os.path.join(os.path.dirname(__file__), 'handlers')
+    logger.debug(f"[HANDLERS] Looking in: {handlers_dir}")
 
-@dp.message()
-async def catch_any_message(message: Message):
-    if message.chat.type in ("channel", "supergroup"):
-        print(f"Сообщение из канала/супергруппы '{message.chat.title}' с ID: {message.chat.id}")
-
-
-@dp.message(Command(commands=['get_channel_id']))
-async def get_channel_id_handler(message: Message, bot: Bot):
-    args = message.text.split()
-    if len(args) < 2:
-        await message.answer("Пожалуйста, укажи username или ID канала, например: /get_channel_id @mychannel")
+    if not os.path.exists(handlers_dir):
+        logger.error(f"[HANDLERS] Directory not found: {handlers_dir}")
         return
 
-    channel_arg = args[1]
+    for filename in os.listdir(handlers_dir):
+        logger.debug(f"[HANDLERS] Found file: {filename}")
+        if filename.endswith('.py') and filename != '__init__.py':
+            module_name = filename[:-3]
+            full_module = f"bot.handlers.{module_name}"
+            logger.debug(f"[HANDLERS] Attempting import: {full_module}")
+            try:
+                module = importlib.import_module(full_module)
+                if hasattr(module, 'register_handlers'):
+                    module.register_handlers(dp)
+                    logger.info(f"[HANDLERS] Registered: {module_name}")
+                else:
+                    logger.warning(f"[HANDLERS] No register_handlers() in {module_name}")
+            except Exception as e:
+                logger.error(f"[HANDLERS] Failed to import {module_name}: {e}")
 
+# === ЖИЗНЕННЫЙ ЦИКЛ ===
+@asynccontextmanager
+async def lifespan(dispatcher: Dispatcher):
+    print("🚀 LIFESPAN STARTED")
+    logger.info("🌀 Starting bot initialization...")
     try:
-        # Если аргумент - число (ID)
-        try:
-            channel_id = int(channel_arg)
-            chat = await bot.get_chat(channel_id)
-        except ValueError:
-            # Иначе считаем username (обязательно с @)
-            if not channel_arg.startswith("@"):
-                await message.answer("Username должен начинаться с @")
-                return
-            chat = await bot.get_chat(channel_arg)
+        await init_db()
+        register_handlers(dispatcher)
+        logger.info("✅ Bot initialized successfully")
+        yield
+    except Exception as e:
+        logger.error(f"💥 Initialization error: {e}")
+        raise
+    finally:
+        logger.info("🛑 Bot shutting down...")
+        await bot.session.close()
 
-        await message.answer(f"ID канала {channel_arg}:\n`{chat.id}`", parse_mode="Markdown")
-    except Exception:
-        error_text = traceback.format_exc()
-        logging.error(f"Ошибка при получении ID канала для аргумента '{channel_arg}':\n{error_text}")
-        await message.answer("Произошла ошибка при получении ID канала. Проверьте правильность username или доступность канала.")
+# === ИНИЦИАЛИЗАЦИЯ DISPATCHER ===
+dp = Dispatcher(lifespan=lifespan)
 
-
-@dp.message(CommandStart())
-async def command_start_handler(message: Message) -> None:
-    """
-    Этот обработчик получает сообщения с `/start` командой
-    """
-    await message.answer(f"Привет, {html.bold(message.from_user.full_name)}!")
-
-def load_routers(dp: Dispatcher, handlers_folder: str = "handlers"):
-    handlers_path = Path(__file__).parent / handlers_folder
-
-    for file in handlers_path.glob("*.py"):
-        if file.name == "__init__.py":
-            continue
-
-        module_name = f"{handlers_folder}.{file.stem}"
-        module = importlib.import_module(module_name)
-
-        router = getattr(module, "router", None)
-        if router:
-            dp.include_router(router)
-            print(f"Router from {module_name} loaded.")
-
-
+# === ЗАПУСК ===
 async def main() -> None:
-    bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-    load_routers(dp)
-
-    await dp.start_polling(bot)
-
+    try:
+        logger.info("🚦 Starting polling...")
+        await dp.start_polling(bot, skip_updates=True)
+    except Exception as e:
+        logger.error(f"Polling error: {e}")
+        raise
+    finally:
+        logger.info("🛑 Polling stopped")
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, stream=sys.stdout)
     asyncio.run(main())
