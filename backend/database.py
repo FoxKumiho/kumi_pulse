@@ -5,95 +5,20 @@ import os
 import json
 import redis.asyncio as redis
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
-from sqlalchemy.orm import declarative_base
 from sqlalchemy.future import select
-from sqlalchemy import (
-    Column, BigInteger, Integer, Boolean, DateTime, JSON, ForeignKey, String, Text, Enum
-)
 from datetime import datetime, timezone
-from typing import Optional, Dict, Any, Union
+from typing import Optional, Dict
 from loguru import logger
 from dotenv import load_dotenv
+from backend.models import (
+    Base, User, Server, PremiumUser, Localization, MediaFile, Story, CommandUsage, ServerAdmin
+)
 
 # Загрузка переменных окружения
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.path.dirname(__file__)), 'config', '.env'))
 
 # Настройка логгера
 logger.add("app.log", rotation="10 MB", level="INFO")
-
-Base = declarative_base()
-
-# Определение моделей
-class User(Base):
-    __tablename__ = 'users'
-    user_id = Column(BigInteger, primary_key=True)
-    username = Column(String(50))
-    first_name = Column(String(100))
-    last_name = Column(String(100))
-    is_bot_owner = Column(Boolean, default=False)
-    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
-    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
-
-class Server(Base):
-    __tablename__ = 'servers'
-    server_id = Column(BigInteger, primary_key=True)
-    server_name = Column(String(100))
-    purpose = Column(String(50), default='COMMUNITY')
-    language_code = Column(String(10), default='en')
-    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
-    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
-
-class PremiumUser(Base):
-    __tablename__ = 'premium_users'
-    id = Column(Integer, primary_key=True)
-    user_id = Column(BigInteger, ForeignKey('users.user_id'))
-    server_id = Column(BigInteger, ForeignKey('servers.server_id'))
-    is_premium = Column(Boolean, default=False)
-    privileges = Column(JSON, default={})
-    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
-
-class Localization(Base):
-    __tablename__ = 'localizations'
-    id = Column(Integer, primary_key=True)
-    resource_key = Column(String(100), nullable=False)
-    language_code = Column(String(10), nullable=False)
-    translation = Column(Text, nullable=False)
-    context = Column(String(50), default='GENERAL')
-
-class MediaFile(Base):
-    __tablename__ = 'media_files'
-    media_id = Column(BigInteger, primary_key=True)
-    file_type = Column(String(50))  # Например, 'photo', 'video', 'audio'
-    file_path = Column(String(255))  # Путь к файлу или URL
-    uploaded_by = Column(BigInteger, ForeignKey('users.user_id'))
-    uploaded_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
-
-class Story(Base):
-    __tablename__ = 'stories'
-    story_id = Column(BigInteger, primary_key=True)
-    server_id = Column(BigInteger, ForeignKey('servers.server_id'))
-    user_id = Column(BigInteger, ForeignKey('users.user_id'))
-    media_id = Column(BigInteger, ForeignKey('media_files.media_id'), nullable=True)
-    content = Column(JSON, default={})
-    expires_at = Column(DateTime)
-    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
-
-class CommandUsage(Base):
-    __tablename__ = 'command_usage'
-    id = Column(Integer, primary_key=True)
-    user_id = Column(BigInteger, ForeignKey('users.user_id'))
-    server_id = Column(BigInteger, ForeignKey('servers.server_id'))
-    command_name = Column(String(50))
-    usage_count = Column(Integer, default=1)
-    last_used = Column(DateTime, default=lambda: datetime.now(timezone.utc))
-
-class ServerAdmin(Base):
-    __tablename__ = 'server_admins'
-    id = Column(Integer, primary_key=True)
-    user_id = Column(BigInteger, ForeignKey('users.user_id'))
-    server_id = Column(BigInteger, ForeignKey('servers.server_id'))
-    permissions = Column(JSON, default={})
-    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 # Конфигурация базы данных
 DB_HOST = os.getenv('DB_HOST', 'localhost')
@@ -247,18 +172,13 @@ async def register_command_usage(
 ) -> bool:
     """Зарегистрировать использование команды."""
     try:
-        result = await session.execute(
-            select(CommandUsage).filter_by(user_id=user_id, server_id=server_id, command_name=command_name)
+        usage = CommandUsage(
+            user_id=user_id,
+            server_id=server_id,
+            command_name=command_name,
+            used_at=datetime.now(timezone.utc)
         )
-        usage = result.scalars().first()
-        if usage:
-            usage.usage_count += 1
-            usage.last_used = datetime.now(timezone.utc)
-        else:
-            usage = CommandUsage(
-                user_id=user_id, server_id=server_id, command_name=command_name
-            )
-            session.add(usage)
+        session.add(usage)
         await session.commit()
         logger.info(f"Зарегистрировано использование команды: {command_name} пользователем {user_id} на сервере {server_id}")
         return True

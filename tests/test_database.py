@@ -4,10 +4,13 @@ import asyncio
 from unittest.mock import AsyncMock, patch
 from datetime import datetime, timedelta, timezone
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
+from sqlalchemy.future import select
 from backend.database import (
-    Base, User, Server, PremiumUser, Localization, Story, CommandUsage, ServerAdmin,
     init_db, get_or_create_user, get_or_create_server, check_premium_status,
     get_translation, create_story, register_command_usage, check_admin_status
+)
+from backend.models import (
+    Base, User, Server, PremiumUser, Localization, Story, CommandUsage, ServerAdmin
 )
 from loguru import logger
 import pytest_asyncio
@@ -195,8 +198,21 @@ async def test_register_command_usage(session: AsyncSession):
     """Тест регистрации использования команды."""
     user = await get_or_create_user(session, user_id=123456789)
     server = await get_or_create_server(session, server_id=-100123456789)
-    result = await register_command_usage(session, user_id=user.user_id, server_id=server.server_id, command_name="start")
+    result = await register_command_usage(
+        session, user_id=user.user_id, server_id=server.server_id, command_name="start"
+    )
     assert result is True
+
+    # Проверяем, что запись создана
+    result = await session.execute(
+        select(CommandUsage).filter_by(user_id=user.user_id, server_id=server.server_id, command_name="start")
+    )
+    usage = result.scalars().first()
+    assert usage is not None
+    assert usage.command_name == "start"
+    assert usage.used_at is not None
+    assert usage.limit_per_user == 10
+    assert usage.limit_window == 60
     with open("test.log") as f:
         assert "Зарегистрировано использование команды: start пользователем 123456789 на сервере -100123456789" in f.read()
 
