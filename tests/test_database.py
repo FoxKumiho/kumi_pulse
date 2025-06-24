@@ -1,4 +1,3 @@
-
 import pytest
 import asyncio
 from unittest.mock import AsyncMock, patch
@@ -14,6 +13,7 @@ from backend.models import (
 )
 from loguru import logger
 import pytest_asyncio
+from backend import database as db
 
 # Настройка временной базы данных SQLite в памяти
 DATABASE_URL = "sqlite+aiosqlite:///:memory:"
@@ -24,6 +24,33 @@ TestAsyncSessionFactory = async_sessionmaker(
 
 # Настройка loguru для вывода логов
 logger.add("test.log", rotation="10 MB", level="INFO")
+
+@pytest.mark.asyncio
+async def test_get_session(monkeypatch):
+    """Тест функции получения сессии get_session с подменой фабрики."""
+    from backend import database as db
+
+    # Подменяем фабрику сессий на тестовую SQLite
+    monkeypatch.setattr(db, "AsyncSessionFactory", TestAsyncSessionFactory)
+
+    # Используем async with для получения сессии
+    async with db.get_session() as session:
+        assert isinstance(session, AsyncSession)
+
+        # Простой запрос без таблиц (setup_database должен был их создать)
+        result = await session.execute(select(User).where(User.user_id == -1))
+        assert result.first() is None
+
+@pytest.mark.asyncio
+async def test_get_session_with_patch():
+    """Тест get_session с подменой фабрики сессий."""
+    original_factory = db.AsyncSessionFactory
+    db.AsyncSessionFactory = TestAsyncSessionFactory
+    try:
+        async with db.get_session() as session:
+            assert isinstance(session, AsyncSession)
+    finally:
+        db.AsyncSessionFactory = original_factory
 
 @pytest_asyncio.fixture(scope="session")
 def event_loop():

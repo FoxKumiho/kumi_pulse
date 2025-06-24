@@ -1,18 +1,22 @@
 #
 # backend/database.py
 #
+
 import os
 import json
 import redis.asyncio as redis
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 from sqlalchemy.future import select
+from sqlalchemy import create_engine, text
+from sqlalchemy.exc import OperationalError, DatabaseError
 from datetime import datetime, timezone
-from typing import Optional, Dict
+from typing import Optional, Dict, AsyncGenerator
 from loguru import logger
 from dotenv import load_dotenv
 from backend.models import (
     Base, User, Server, PremiumUser, Localization, MediaFile, Story, CommandUsage, ServerAdmin
 )
+from contextlib import asynccontextmanager
 
 # Загрузка переменных окружения
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.path.dirname(__file__)), 'config', '.env'))
@@ -23,27 +27,60 @@ logger.add("app.log", rotation="10 MB", level="INFO")
 # Конфигурация базы данных
 DB_HOST = os.getenv('DB_HOST', 'localhost')
 DB_PORT = os.getenv('DB_PORT', '3306')
-DB_USER = os.getenv('DB_USER', 'root')
-DB_PASSWORD = os.getenv('DB_PASSWORD', '')
-DB_NAME = os.getenv('DB_NAME', 'kumi_pulse')
-REDIS_URL = os.getenv('REDIS_URL')
+DB_USER = os.getenv('DB_USER', 'kumi_user')
+DB_PASSWORD = os.getenv('DB_PASSWORD', 'Zaqwerdx21')
+DB_NAME = os.getenv('DB_NAME', 'kumi_db')
+REDIS_URL = os.getenv('REDIS_URL', None)
+OWNER_BOT_ID = int(os.getenv('OWNER_BOT_ID', '5927437141'))
 
 DATABASE_URL = f"mysql+asyncmy://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 engine = create_async_engine(DATABASE_URL, echo=False)
 AsyncSessionFactory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
-async def get_session() -> AsyncSession:
+@asynccontextmanager
+async def get_session() -> AsyncGenerator[AsyncSession, None]:
     async with AsyncSessionFactory() as session:
-        yield session
+        try:
+            yield session
+        except Exception as e:
+            logger.error(f"Ошибка в сессии базы данных: {e}")
+            await session.rollback()
+            raise
+        finally:
+            await session.close()
 
 async def init_db():
     """Инициализация базы данных."""
     try:
+        # Пропускаем создание базы для SQLite (используется в тестах)
+        if "sqlite" not in DATABASE_URL:
+            # Создание базы данных, если она не существует (для MySQL)
+            sync_url = DATABASE_URL.replace("mysql+asyncmy", "mysql+pymysql")
+            sync_engine = create_engine(sync_url.replace(f"/{DB_NAME}", ""))
+            with sync_engine.connect() as conn:
+                conn.execute(text(f"CREATE DATABASE IF NOT EXISTS {DB_NAME}"))
+            sync_engine.dispose()
+            logger.info(f"База данных {DB_NAME} проверена/создана")
+
+        # Инициализация таблиц
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
-        logger.info("База данных успешно инициализирована")
+        logger.info("Таблицы базы данных успешно инициализированы")
+
+        # Создание записи владельца бота, если не существует
+        async with get_session() as session:
+            owner = await get_or_create_user(
+                session, user_id=OWNER_BOT_ID, username="bot_owner",
+                first_name="Bot", last_name="Owner", is_bot_owner=True
+            )
+            await session.commit()
+        logger.info(f"Владелец бота с ID {OWNER_BOT_ID} инициализирован")
+
+    except (OperationalError, DatabaseError) as e:
+        logger.error(f"Ошибка подключения к базе данных: {e}")
+        raise
     except Exception as e:
-        logger.error(f"Ошибка инициализации базы данных: {e}")
+        logger.error(f"Неожиданная ошибка при инициализации базы данных: {e}")
         raise
 
 async def get_or_create_user(
@@ -142,6 +179,7 @@ async def get_translation(
         localization = result.scalars().first()
         translation = localization.translation if localization else resource_key
         if REDIS_URL:
+            r = redis.from_url(REDIS_URL)
             await r.set(cache_key, translation, ex=3600)
             await r.close()
         return translation
