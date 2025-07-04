@@ -163,4 +163,17 @@ def quicksort(arr):
 
 print(quicksort([3,4,5,10,1,3,2,1]))
 
+def __dir__():
+    return 
+
 print(f"привет")
+
+input_line = input()
+numbers_as_strings = input_line.split()
+a = int(numbers_as_strings[0])
+b = int(numbers_as_strings[1])
+sum_result = a + b
+print(sum_result)
+
+
+print(('up', 3)

@@ -1,81 +1,181 @@
-#
-# kumi_pulse/bot/handlers/start.py
-#
-print("✅ start.py загружен")
-import os
-import sys
-from aiogram import Dispatcher, types
+# Путь файла: bot/handlers/start.py
+
+from aiogram import Router, F
 from aiogram.filters import Command
+from aiogram.types import Message
+from aiogram.exceptions import TelegramBadRequest
+from bot.modules.no_sql.user_db import User, get_user, set_server_owner, OWNER_BOT_ID, ROLE_NAMES
+from bot.handlers.common import register_all_chat_members
 from loguru import logger
+import time
+from typing import Optional
+import aiogram
 
-# Добавляем корень проекта в sys.path для корректного импорта
-project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
-sys.path.insert(0, project_root)
-logger.debug(f"Project root added to sys.path in start.py: {project_root}")
+# Используем aiogram версии 3.20.0.post0
+assert aiogram.__version__ == "3.20.0.post0", f"Expected aiogram version 3.20.0.post0, but found {aiogram.__version__}"
 
-# Отладка: проверяем наличие backend/database.py
-backend_path = os.path.join(project_root, 'backend', 'database.py')
-if not os.path.exists(backend_path):
-    logger.error(f"File {backend_path} does not exist")
-    raise FileNotFoundError(f"File {backend_path} does not exist")
-else:
-    logger.debug(f"File {backend_path} found")
-
+# Отладочный лог для проверки импорта ROLE_NAMES
 try:
-    from backend.database import get_or_create_user, get_translation, get_session
-    logger.debug("Successfully imported backend.database in start.py")
-except ModuleNotFoundError as e:
-    logger.error(f"Failed to import backend.database in start.py: {e}")
+    logger.info(f"ROLE_NAMES успешно импортирован: {ROLE_NAMES}")
+except NameError as e:
+    logger.error(f"Ошибка импорта ROLE_NAMES: {str(e)}")
     raise
 
-# Настройка логгера
-logger.add("app.log", rotation="10 MB", level="INFO", format="{time} {level} {message}")
+# Инициализация маршрутизатора
+router = Router()
 
-async def start_command(message: types.Message) -> None:
-    """Обработчик команды /start."""
+# Время запуска бота
+START_TIME = time.time()
+
+# Константы для сообщений
+WELCOME_MESSAGE = (
+    "🌟 **Добро пожаловать!** 🌟\n"
+    "👋 Привет, {name}!\n"
+    "🎭 **Твоя роль**: {role}\n"
+    "⏰ **Бот работает**: {uptime}\n"
+    "{args_text}\n"
+    "ℹ️ Используй **/help**, чтобы узнать доступные команды.\n"
+    "⚠️ Если роль неверна или не все участники зарегистрированы, попробуй **/start test_owner** или **/force_register_all**."
+)
+HELP_MESSAGE = (
+    "📚 **Список команд** 📚\n"
+    "👋 **/start** — Запустить бота и зарегистрироваться (для всех)\n"
+    "ℹ️ **/help** — Показать это сообщение (для всех)\n"
+    "💎 **/premium** — Проверить статус Premium (для всех, реализация ожидается)\n"
+    "🛠️ **/admin** — Команды для модераторов и администраторов (для модераторов, реализация ожидается)\n"
+    "⚠️ **/warn <user_id | @username | имя> [причина]** — Выдать предупреждение (Младший модератор)\n"
+    "🧹 **/clear_warnings <user_id | @username | имя>** — Очистить предупреждения (Старший модератор)\n"
+    "🗑️ **/clear <количество> | reply** — Удалить сообщения (Младший модератор)\n"
+    "🔇 **/mute <user_id | @username | имя> <длительность_в_минутах> [причина]** — Замутить пользователя (Старший модератор)\n"
+    "🔊 **/unmute <user_id | @username | имя>** — Снять мут (Старший модератор)\n"
+    "🚫 **/ban <user_id | @username | имя> [длительность_в_минутах] [причина]** — Забанить пользователя (Младший админ)\n"
+    "✅ **/unban <user_id | @username | имя>** — Разбанить пользователя (Старший админ)\n"
+    "👢 **/kick <user_id | @username | имя> [причина]** — Исключить пользователя (Младший админ)\n"
+    "📊 **/user_status <user_id | @username | имя>** — Показать статус пользователя (Младший админ)\n"
+    "📜 **/mod_logs** — Показать последние действия модерации (Старший модератор)\n"
+    "❓ **/help_moderation** — Список модераторских команд (Младший модератор)\n"
+    "📋 **/register_all** — Зарегистрировать администраторов чата (Владелец сервера)\n"
+    "📋 **/force_register_all** — Зарегистрировать всех участников чата (Владелец сервера)\n"
+    "\n🎭 **Твоя роль**: {role}"
+)
+ERROR_MESSAGE = (
+    "🚫 Произошла ошибка! Попробуй позже или обратись в поддержку."
+)
+PERMISSION_ERROR_MESSAGE = (
+    "⚠️ Не удалось зарегистрировать всех участников чата.\n"
+    "🔐 Убедись, что бот имеет права администратора с доступом к списку участников.\n"
+    "📋 Попробуй команду **/force_register_all**."
+)
+
+def get_readable_time(seconds: int) -> str:
+    """
+    Преобразует секунды в читаемый формат времени (дни, часы, минуты, секунды).
+
+    Args:
+        seconds: Количество секунд
+
+    Returns:
+        Строка в формате, например, "1d:2h:30m:15s"
+    """
+    count = 0
+    ping_time = ""
+    time_list = []
+    time_suffix_list = ["s", "m", "h", "days"]
+
+    while count < 4:
+        count += 1
+        remainder, result = divmod(seconds, 60) if count < 3 else divmod(seconds, 24)
+        if seconds == 0 and remainder == 0:
+            break
+        time_list.append(int(result))
+        seconds = int(remainder)
+
+    for x in range(len(time_list)):
+        time_list[x] = str(time_list[x]) + time_suffix_list[x]
+    if len(time_list) == 4:
+        ping_time += time_list.pop() + ", "
+
+    time_list.reverse()
+    ping_time += ":".join(time_list)
+
+    return ping_time
+
+@router.message(Command(commands=["start"]))
+async def start_handler(message: Message) -> None:
+    """
+    Обработчик команды /start. Регистрирует пользователя, проверяет его роль и
+    пытается зарегистрировать всех участников в групповом чате.
+
+    Args:
+        message: Объект сообщения от aiogram
+    """
+    user_id: int = message.from_user.id
+    chat_id: int = message.chat.id
+    args: Optional[str] = message.text.split(maxsplit=1)[1] if len(message.text.split()) > 1 else None
+
     try:
-        logger.debug(f"Received /start command from user {message.from_user.id}")
-        user_id = message.from_user.id
-        username = message.from_user.username
-        first_name = message.from_user.first_name
-        last_name = message.from_user.last_name
-        language_code = message.from_user.language_code or "en"
-        logger.debug(f"User details: user_id={user_id}, username={username}, language_code={language_code}")
+        # Получаем или создаем пользователя
+        user: User = await get_user(user_id, create_if_not_exists=True, chat_id=chat_id)
+        uptime: str = get_readable_time(int(time.time() - START_TIME))
 
-        # Получаем или создаем пользователя в базе данных
-        async with get_session() as session:
-            logger.debug(f"Creating or fetching user {user_id}")
-            user = await get_or_create_user(
-                session,
-                user_id=user_id,
-                username=username,
-                first_name=first_name,
-                last_name=last_name
-            )
-            logger.debug(f"User {user_id} fetched or created: {user.username}")
-            # Получаем локализованное приветственное сообщение
-            logger.debug(f"Fetching translation for greeting in {language_code}")
-            greeting = await get_translation(
-                session,
-                resource_key="greeting",
-                language_code=language_code
-            )
-            logger.debug(f"Translation fetched: {greeting}")
+        # Проверяем владельца чата через Telegram API
+        if message.chat.type in ["group", "supergroup"]:
+            try:
+                chat_admins = await message.bot.get_chat_administrators(chat_id)
+                for admin in chat_admins:
+                    if admin.user.id == user_id and admin.status == "creator":
+                        if chat_id not in user.server_owner_chat_ids:
+                            await set_server_owner(user_id, chat_id)
+                            user = await get_user(user_id, create_if_not_exists=False, chat_id=chat_id)
+                            logger.info(f"Пользователь {user_id} определен как владелец чата {chat_id} через API")
 
-        # Отправляем приветственное сообщение
-        await message.answer(greeting)
-        logger.info(f"User {user_id} executed /start command, greeted in {language_code}")
+                # Регистрируем всех участников чата
+                await register_all_chat_members(chat_id, message.bot)
+                logger.info(f"Успешная регистрация участников для chat_id={chat_id}")
+            except TelegramBadRequest as e:
+                logger.warning(f"Не удалось зарегистрировать участников чата {chat_id}: {str(e)}")
+                if user.role_level >= 6:
+                    await message.answer(PERMISSION_ERROR_MESSAGE)
 
+        # Тестовая роль владельца сервера
+        if args == "test_owner" and user.role_level < 6:
+            await set_server_owner(user_id, chat_id)
+            user = await get_user(user_id, create_if_not_exists=False, chat_id=chat_id)
+            logger.info(f"Установлена тестовая роль Владелец сервера для user_id={user_id}, chat_id={chat_id}")
+
+        # Формируем ответ
+        args_text: str = f"📦 **Аргументы**: {args}\n" if args else ""
+        text: str = WELCOME_MESSAGE.format(
+            name=user.display_name or message.from_user.full_name,
+            role=user.get_role_for_chat(chat_id),
+            uptime=uptime,
+            args_text=args_text
+        )
+        await message.answer(text)
+        logger.info(f"Команда /start обработана: user_id={user_id}, chat_id={chat_id}, роль={user.get_role_for_chat(chat_id)}")
     except Exception as e:
-        logger.error(f"Error handling /start command for user {user_id}: {e}")
-        await message.answer("An error occurred. Please try again poppy")
+        logger.error(f"Ошибка в /start: user_id={user_id}, chat_id={chat_id}, ошибка={str(e)}")
+        await message.answer(ERROR_MESSAGE)
 
-def register_handlers(dp: Dispatcher) -> None:
-    """Регистрация обработчиков для команды /start."""
-    logger.warning("!!! REGISTER_HANDLER START.PY WORKS !!!")
+@router.message(Command(commands=["help"]))
+async def help_handler(message: Message) -> None:
+    """
+    Обработчик команды /help. Отправляет список доступных команд.
+
+    Args:
+        message: Объект сообщения от aiogram
+    """
+    user_id: int = message.from_user.id
+    chat_id: int = message.chat.id
     try:
-        logger.debug("Registering start command handler")
-        dp.message.register(start_command, Command(commands=["start"]))
-        logger.info("Start command handler registered successfully")
+        user: User = await get_user(user_id, create_if_not_exists=True, chat_id=chat_id)
+        logger.debug(f"Форматирование HELP_MESSAGE для user_id={user_id}, chat_id={chat_id}")
+        text: str = HELP_MESSAGE.format(
+            name=user.display_name or message.from_user.full_name,
+            role=user.get_role_for_chat(chat_id)
+        )
+        await message.answer(text)
+        logger.info(f"Команда /help обработана: user_id={user_id}, chat_id={chat_id}, роль={user.get_role_for_chat(chat_id)}")
     except Exception as e:
-        logger.error(f"Failed to register start command handler: {e}")
+        logger.error(f"Ошибка в /help: user_id={user_id}, chat_id={chat_id}, ошибка={str(e)}")
+        await message.answer(ERROR_MESSAGE)
