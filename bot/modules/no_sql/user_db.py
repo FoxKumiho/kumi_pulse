@@ -10,12 +10,32 @@ from loguru import logger
 from pymongo.errors import DuplicateKeyError
 from dotenv import load_dotenv
 import aiogram
+from aiocache import cached
 
 # Проверка версии aiogram
 assert aiogram.__version__ == "3.20.0.post0", f"Expected aiogram version 3.20.0.post0, but found {aiogram.__version__}"
 
-# Загружаем переменные из .env файла
+# Настройка loguru
 BASE_DIR = Path(__file__).resolve().parent.parent.parent.parent
+LOG_FILE = BASE_DIR / "app.log"
+os.makedirs(BASE_DIR, exist_ok=True)  # Создаём директорию, если она отсутствует
+try:
+    logger.add(
+        LOG_FILE,
+        format="{time} {level} {message}",
+        level="INFO",
+        rotation="10 MB",
+        retention="7 days"
+    )
+    logger.info(f"Логирование настроено для файла: {LOG_FILE}")
+except PermissionError as e:
+    logger.error(f"Ошибка прав доступа при настройке логирования в {LOG_FILE}: {str(e)}")
+    raise
+except Exception as e:
+    logger.error(f"Ошибка при настройке логирования: {str(e)}")
+    raise
+
+# Загружаем переменные из .env файла
 ENV_FILE = BASE_DIR / "config" / ".env"
 if not ENV_FILE.exists():
     logger.error(f"Файл {ENV_FILE} не найден. Убедитесь, что он существует в папке config/")
@@ -31,6 +51,9 @@ try:
 except ValueError as e:
     logger.error(f"Ошибка при загрузке OWNER_BOT_ID: {str(e)}")
     raise
+
+# Допустимые действия модерации
+VALID_MODERATION_ACTIONS = {"warn", "ban", "mute", "unban", "unmute", "kick", "clear_warnings", "delete"}
 
 # Словарь для сопоставления уровней ролей с их названиями
 ROLE_NAMES = {
@@ -70,7 +93,6 @@ class User:
                  minutes_active: int = 0, is_banned: bool = False, warnings: dict = None,
                  role_level: int = 0, is_bot: bool = False, id: str = None,
                  activity_count: Dict[str, int] = None, bans: dict = None, mutes: dict = None):
-        self.role_name = None
         self.id = id
         self.user_id = user_id
         self.username = username
@@ -83,12 +105,12 @@ class User:
         self.last_active = last_active or time.time()
         self.minutes_active = minutes_active
         self.is_banned = is_banned  # Устаревшее поле, сохранено для обратной совместимости
-        self.warnings = warnings or {}  # {chat_id: [{reason: str, issued_by: int, issued_at: float}]}
+        self.warnings = warnings or {}
         self.role_level = role_level
         self.is_bot = is_bot
         self.activity_count = activity_count or {}
-        self.bans = bans or {}  # {chat_id: {is_banned: bool, reason: str, issued_by: int, issued_at: float, until: float}}
-        self.mutes = mutes or {}  # {chat_id: {is_muted: bool, until: float, reason: str, issued_by: int, issued_at: float}}
+        self.bans = bans or {}
+        self.mutes = mutes or {}
 
     def to_dict(self) -> Dict:
         """Преобразует объект User в словарь для сохранения в MongoDB."""
@@ -149,13 +171,85 @@ class User:
         """Возвращает счетчик активности для указанного чата."""
         return self.activity_count.get(str(chat_id), 0)
 
+    def is_banned_in_chat(self, chat_id: int) -> bool:
+        """Проверяет, забанен ли пользователь в указанном чате."""
+        ban_info = self.bans.get(str(chat_id), {})
+        if ban_info.get("is_banned", False):
+            until = ban_info.get("until", 0.0)
+            if until == 0.0 or until > time.time():
+                return True
+            # Срок бана истек
+            self.bans[str(chat_id)] = {
+                "is_banned": False, "reason": "", "issued_by": 0, "issued_at": 0.0, "until": 0.0
+            }
+        return False
+
+    def is_muted_in_chat(self, chat_id: int) -> bool:
+        """Проверяет, замучен ли пользователь в указанном чате."""
+        mute_info = self.mutes.get(str(chat_id), {})
+        if mute_info.get("is_muted", False):
+            until = mute_info.get("until", 0.0)
+            if until > time.time():
+                return True
+            # Срок мута истек
+            self.mutes[str(chat_id)] = {
+                "is_muted": False, "until": 0.0, "reason": "", "issued_by": 0, "issued_at": 0.0
+            }
+        return False
+
+async def ensure_user_exists(
+    user_id: int,
+    chat_id: int,
+    username: Optional[str] = None,
+    display_name: Optional[str] = None,
+    is_bot: bool = False
+) -> User:
+    """Гарантирует существование пользователя в базе данных, создавая или обновляя запись."""
+    if not isinstance(user_id, int) or user_id <= 0:
+        logger.error(f"Недействительный user_id: {user_id}")
+        raise ValueError("user_id должен быть положительным целым числом")
+    if not isinstance(chat_id, int) or chat_id >= 0:
+        logger.error(f"Недействительный chat_id: {chat_id}")
+        raise ValueError("chat_id должен быть отрицательным целым числом")
+
+    try:
+        # Проверяем, существует ли пользователь
+        user = await get_user(user_id, create_if_not_exists=False, chat_id=chat_id)
+        # Обновляем данные пользователя
+        updates = {
+            "username": username,
+            "display_name": display_name,
+            "is_bot": is_bot,
+            "last_active": time.time()
+        }
+        if chat_id not in user.group_ids:
+            updates["group_ids"] = user.group_ids + [chat_id]
+        if user_id == OWNER_BOT_ID and user.role_level != 7:
+            updates["role_level"] = 7
+        await update_user(user_id, updates)
+        logger.info(f"Обновлен пользователь user_id={user_id} для chat_id={chat_id}")
+        return await get_user(user_id, chat_id=chat_id)
+    except ValueError:
+        # Пользователь не найден, создаем нового
+        role_level = 7 if user_id == OWNER_BOT_ID else 0
+        user = User(
+            user_id=user_id,
+            username=username,
+            display_name=display_name,
+            group_ids=[chat_id],
+            is_bot=is_bot,
+            role_level=role_level
+        )
+        logger.info(f"Создается новый пользователь user_id={user_id} для chat_id={chat_id}")
+        return await create_user(user, chat_id=chat_id)
+    except Exception as e:
+        logger.error(f"Ошибка при создании/обновлении пользователя user_id={user_id} в chat_id={chat_id}: {str(e)}")
+        raise
+
 async def init_moderation_logs_collection():
-    """
-    Инициализирует коллекцию moderation_logs с индексами по chat_id и issued_at.
-    """
+    """Инициализирует коллекцию moderation_logs с индексами по chat_id и issued_at."""
     collection = await get_moderation_logs_collection()
     try:
-        # Создание составного индекса для оптимизации запросов по chat_id и issued_at
         await collection.create_index([("chat_id", 1), ("issued_at", -1)])
         logger.info("Индекс для moderation_logs (chat_id, issued_at) создан или уже существует")
     except Exception as e:
@@ -163,39 +257,66 @@ async def init_moderation_logs_collection():
         raise
 
 async def init_user_collection():
-    """
-    Инициализирует коллекцию users с индексом по user_id и выполняет миграцию данных.
-    """
+    """Инициализирует коллекцию users с индексом и выполняет миграцию данных."""
     collection = await get_user_collection()
     try:
-        # Создание индекса
         await collection.create_index("user_id", unique=True)
         logger.info("Индекс для user_id создан или уже существует")
 
-        # Миграция для исправления некорректных типов warnings, bans, mutes
-        async for user in collection.find({
-            "$or": [
-                {"warnings": {"$not": {"$type": "object"}}},
-                {"bans": {"$not": {"$type": "object"}}},
-                {"mutes": {"$not": {"$type": "object"}}}
-            ]
-        }):
-            update_data = {}
+        # Миграция данных: исправление некорректных типов и инициализация полей
+        async for user in collection.find({}):
+            updates = {}
             if not isinstance(user.get("warnings"), dict):
-                update_data["warnings"] = {}
+                updates["warnings"] = {}
             if not isinstance(user.get("bans"), dict):
-                update_data["bans"] = {}
+                updates["bans"] = {}
             if not isinstance(user.get("mutes"), dict):
-                update_data["mutes"] = {}
-            if update_data:
+                updates["mutes"] = {}
+            if not isinstance(user.get("activity_count"), dict):
+                updates["activity_count"] = {}
+            if user.get("user_id") == OWNER_BOT_ID and user.get("role_level", 0) != 7:
+                updates["role_level"] = 7
+            known_chats = await get_known_chats()
+            for chat_id in known_chats:
+                chat_id_str = str(chat_id)
+                if chat_id_str not in user.get("activity_count", {}):
+                    updates[f"activity_count.{chat_id_str}"] = 0
+                if chat_id_str not in user.get("warnings", {}):
+                    updates[f"warnings.{chat_id_str}"] = []
+                if chat_id_str not in user.get("bans", {}):
+                    updates[f"bans.{chat_id_str}"] = {
+                        "is_banned": False, "reason": "", "issued_by": 0, "issued_at": 0.0, "until": 0.0
+                    }
+                if chat_id_str not in user.get("mutes", {}):
+                    updates[f"mutes.{chat_id_str}"] = {
+                        "is_muted": False, "until": 0.0, "reason": "", "issued_by": 0, "issued_at": 0.0
+                    }
+            if updates:
                 await collection.update_one(
                     {"user_id": user["user_id"]},
-                    {"$set": update_data}
+                    {"$set": updates}
                 )
-                logger.info(f"Миграция данных для user_id={user['user_id']}: исправлены поля {list(update_data.keys())}")
+                logger.info(f"Миграция данных для user_id={user['user_id']}: исправлены поля {list(updates.keys())}")
     except Exception as e:
         logger.error(f"Ошибка при инициализации коллекции пользователей: {e}")
         raise
+
+async def initialize_user_fields(user: User, chat_id: Optional[int] = None) -> User:
+    """Инициализирует поля пользователя для всех известных чатов."""
+    known_chats = await get_known_chats()
+    if chat_id and chat_id not in known_chats:
+        known_chats.append(chat_id)
+    for known_chat_id in known_chats:
+        chat_id_str = str(known_chat_id)
+        if chat_id_str not in user.activity_count:
+            user.activity_count[chat_id_str] = 0
+        if chat_id_str not in user.warnings:
+            user.warnings[chat_id_str] = []
+        if chat_id_str not in user.bans:
+            user.bans[chat_id_str] = {"is_banned": False, "reason": "", "issued_by": 0, "issued_at": 0.0, "until": 0.0}
+        if chat_id_str not in user.mutes:
+            user.mutes[chat_id_str] = {"is_muted": False, "until": 0.0, "reason": "", "issued_by": 0, "issued_at": 0.0}
+    return user
 
 async def create_user(user: User, chat_id: Optional[int] = None) -> User:
     """Создает нового пользователя в базе данных или обновляет существующего."""
@@ -211,26 +332,7 @@ async def create_user(user: User, chat_id: Optional[int] = None) -> User:
         user.role_level = 7
         logger.info(f"Пользователь {user.user_id} определен как владелец бота, присвоен role_level: 7")
 
-    if chat_id:
-        if str(chat_id) not in user.activity_count:
-            user.activity_count[str(chat_id)] = 0
-        if str(chat_id) not in user.warnings:
-            user.warnings[str(chat_id)] = []
-        if str(chat_id) not in user.bans:
-            user.bans[str(chat_id)] = {"is_banned": False, "reason": "", "issued_by": 0, "issued_at": 0.0, "until": 0.0}
-        if str(chat_id) not in user.mutes:
-            user.mutes[str(chat_id)] = {"is_muted": False, "until": 0.0, "reason": "", "issued_by": 0, "issued_at": 0.0}
-        known_chats = await get_known_chats()
-        for known_chat_id in known_chats:
-            if str(known_chat_id) not in user.activity_count:
-                user.activity_count[str(known_chat_id)] = 0
-            if str(known_chat_id) not in user.warnings:
-                user.warnings[str(known_chat_id)] = []
-            if str(known_chat_id) not in user.bans:
-                user.bans[str(known_chat_id)] = {"is_banned": False, "reason": "", "issued_by": 0, "issued_at": 0.0, "until": 0.0}
-            if str(known_chat_id) not in user.mutes:
-                user.mutes[str(known_chat_id)] = {"is_muted": False, "until": 0.0, "reason": "", "issued_by": 0, "issued_at": 0.0}
-
+    user = await initialize_user_fields(user, chat_id)
     collection = await get_user_collection()
     try:
         result = await collection.insert_one(user.to_dict())
@@ -246,26 +348,8 @@ async def create_user(user: User, chat_id: Optional[int] = None) -> User:
         }
         if user.user_id == OWNER_BOT_ID:
             updates["role_level"] = 7
-        if chat_id:
-            updates["group_ids"] = user.group_ids + [chat_id] if chat_id not in user.group_ids else user.group_ids
-            if str(chat_id) not in user.activity_count:
-                updates[f"activity_count.{chat_id}"] = 0
-            if str(chat_id) not in user.warnings:
-                updates[f"warnings.{chat_id}"] = []
-            if str(chat_id) not in user.bans:
-                updates[f"bans.{chat_id}"] = {"is_banned": False, "reason": "", "issued_by": 0, "issued_at": 0.0, "until": 0.0}
-            if str(chat_id) not in user.mutes:
-                updates[f"mutes.{chat_id}"] = {"is_muted": False, "until": 0.0, "reason": "", "issued_by": 0, "issued_at": 0.0}
-            known_chats = await get_known_chats()
-            for known_chat_id in known_chats:
-                if str(known_chat_id) not in user.activity_count:
-                    updates[f"activity_count.{known_chat_id}"] = 0
-                if str(known_chat_id) not in user.warnings:
-                    updates[f"warnings.{known_chat_id}"] = []
-                if str(known_chat_id) not in user.bans:
-                    updates[f"bans.{known_chat_id}"] = {"is_banned": False, "reason": "", "issued_by": 0, "issued_at": 0.0, "until": 0.0}
-                if str(known_chat_id) not in user.mutes:
-                    updates[f"mutes.{known_chat_id}"] = {"is_muted": False, "until": 0.0, "reason": "", "issued_by": 0, "issued_at": 0.0}
+        if chat_id and chat_id not in user.group_ids:
+            updates["group_ids"] = user.group_ids + [chat_id]
         await update_user(user.user_id, updates)
         logger.info(f"Обновлен пользователь: {user.user_id}, роль: {ROLE_NAMES.get(updates.get('role_level', 0), 'Неизвестная роль')}, chat_id={chat_id}")
         return await get_user(user.user_id, create_if_not_exists=False, chat_id=chat_id)
@@ -279,7 +363,6 @@ async def get_user(user_id: int, create_if_not_exists: bool = False, chat_id: Op
     collection = await get_user_collection()
     user_data = await collection.find_one({"user_id": user_id})
     if user_data:
-        # Исправляем некорректные типы полей warnings, bans, mutes
         updates = {"last_active": time.time()}
         if not isinstance(user_data.get("warnings"), dict):
             updates["warnings"] = {}
@@ -287,50 +370,33 @@ async def get_user(user_id: int, create_if_not_exists: bool = False, chat_id: Op
             updates["bans"] = {}
         if not isinstance(user_data.get("mutes"), dict):
             updates["mutes"] = {}
+        if not isinstance(user_data.get("activity_count"), dict):
+            updates["activity_count"] = {}
         if user_id == OWNER_BOT_ID and user_data.get("role_level", 0) != 7:
             updates["role_level"] = 7
         if chat_id and chat_id not in user_data.get("group_ids", []):
             updates["group_ids"] = user_data.get("group_ids", []) + [chat_id]
-        if chat_id:
-            if str(chat_id) not in user_data.get("activity_count", {}):
-                updates[f"activity_count.{chat_id}"] = 0
-            if str(chat_id) not in user_data.get("warnings", {}):
-                updates[f"warnings.{chat_id}"] = []
-            if str(chat_id) not in user_data.get("bans", {}):
-                updates[f"bans.{chat_id}"] = {"is_banned": False, "reason": "", "issued_by": 0, "issued_at": 0.0, "until": 0.0}
-            if str(chat_id) not in user_data.get("mutes", {}):
-                updates[f"mutes.{chat_id}"] = {"is_muted": False, "until": 0.0, "reason": "", "issued_by": 0, "issued_at": 0.0}
-        known_chats = await get_known_chats()
-        for known_chat_id in known_chats:
-            if str(known_chat_id) not in user_data.get("activity_count", {}):
-                updates[f"activity_count.{known_chat_id}"] = 0
-            if str(known_chat_id) not in user_data.get("warnings", {}):
-                updates[f"warnings.{known_chat_id}"] = []
-            if str(known_chat_id) not in user_data.get("bans", {}):
-                updates[f"bans.{known_chat_id}"] = {"is_banned": False, "reason": "", "issued_by": 0, "issued_at": 0.0, "until": 0.0}
-            if str(known_chat_id) not in user_data.get("mutes", {}):
-                updates[f"mutes.{known_chat_id}"] = {"is_muted": False, "until": 0.0, "reason": "", "issued_by": 0, "issued_at": 0.0}
-        if len(updates) > 1:
-            await update_user(user_id, updates)
-            user_data = await collection.find_one({"user_id": user_id})
         user = User.from_dict(dict(user_data))
+        user = await initialize_user_fields(user, chat_id)
+        if updates:
+            await collection.update_one({"user_id": user_id}, {"$set": updates})
+            user_data = await collection.find_one({"user_id": user_id})
+            user = User.from_dict(dict(user_data))
         logger.info(f"Найден пользователь: {user_id}, роль: {user.get_role_for_chat(chat_id)}, chat_id={chat_id}")
+        if user.is_banned_in_chat(chat_id) or user.is_muted_in_chat(chat_id):
+            await update_user(user_id, {
+                "bans": user.bans,
+                "mutes": user.mutes
+            })
         return user
 
     if create_if_not_exists:
         role_level = 7 if user_id == OWNER_BOT_ID else 0
-        activity_count = {str(chat_id): 0} if chat_id else {}
-        warnings = {str(chat_id): []} if chat_id else {}
-        bans = {str(chat_id): {"is_banned": False, "reason": "", "issued_by": 0, "issued_at": 0.0, "until": 0.0}} if chat_id else {}
-        mutes = {str(chat_id): {"is_muted": False, "until": 0.0, "reason": "", "issued_by": 0, "issued_at": 0.0}} if chat_id else {}
-        known_chats = await get_known_chats()
-        for known_chat_id in known_chats:
-            activity_count[str(known_chat_id)] = 0
-            warnings[str(known_chat_id)] = []
-            bans[str(known_chat_id)] = {"is_banned": False, "reason": "", "issued_by": 0, "issued_at": 0.0, "until": 0.0}
-            mutes[str(known_chat_id)] = {"is_muted": False, "until": 0.0, "reason": "", "issued_by": 0, "issued_at": 0.0}
-        user = User(user_id=user_id, role_level=role_level, group_ids=[chat_id] if chat_id else [],
-                    activity_count=activity_count, warnings=warnings, bans=bans, mutes=mutes)
+        user = User(
+            user_id=user_id,
+            role_level=role_level,
+            group_ids=[chat_id] if chat_id else []
+        )
         return await create_user(user, chat_id=chat_id)
 
     logger.debug(f"Пользователь не найден: {user_id}")
@@ -338,6 +404,9 @@ async def get_user(user_id: int, create_if_not_exists: bool = False, chat_id: Op
 
 async def get_users_by_chat_id(chat_id: int) -> List[User]:
     """Получает список пользователей, связанных с указанным chat_id."""
+    if not isinstance(chat_id, int) or chat_id >= 0:
+        logger.error(f"Недействительный chat_id: {chat_id}")
+        raise ValueError("chat_id должен быть отрицательным целым числом")
     collection = await get_user_collection()
     cursor = collection.find({
         "$or": [
@@ -346,9 +415,16 @@ async def get_users_by_chat_id(chat_id: int) -> List[User]:
         ]
     })
     users = [User.from_dict(dict(user_data)) async for user_data in cursor]
+    for user in users:
+        if user.is_banned_in_chat(chat_id) or user.is_muted_in_chat(chat_id):
+            await update_user(user.user_id, {
+                "bans": user.bans,
+                "mutes": user.mutes
+            })
     logger.info(f"Найдено {len(users)} пользователей для chat_id={chat_id}")
     return users
 
+@cached(ttl=3600)
 async def get_all_user_ids() -> List[int]:
     """Получает список всех user_id из коллекции users."""
     collection = await get_user_collection()
@@ -390,6 +466,9 @@ async def update_user(user_id: int, updates: Dict) -> bool:
 
 async def increment_activity_count(user_id: int, chat_id: int) -> bool:
     """Инкрементирует счетчик активности пользователя в указанном чате."""
+    if not isinstance(chat_id, int) or chat_id >= 0:
+        logger.error(f"Недействительный chat_id: {chat_id}")
+        raise ValueError("chat_id должен быть отрицательным целым числом")
     try:
         collection = await get_user_collection()
         user = await collection.find_one({"user_id": user_id})
@@ -399,29 +478,6 @@ async def increment_activity_count(user_id: int, chat_id: int) -> bool:
         if user.get("is_bot", False):
             logger.debug(f"Пропущено увеличение активности для бота: user_id={user_id}, chat_id={chat_id}")
             return False
-        if not isinstance(user.get("warnings"), dict):
-            await collection.update_one(
-                {"user_id": user_id},
-                {"$set": {"warnings": {}}}
-            )
-            logger.info(f"Исправлено поле warnings для user_id={user_id}")
-        if not isinstance(user.get("bans"), dict):
-            await collection.update_one(
-                {"user_id": user_id},
-                {"$set": {"bans": {}}}
-            )
-            logger.info(f"Исправлено поле bans для user_id={user_id}")
-        if not isinstance(user.get("mutes"), dict):
-            await collection.update_one(
-                {"user_id": user_id},
-                {"$set": {"mutes": {}}}
-            )
-            logger.info(f"Исправлено поле mutes для user_id={user_id}")
-        if str(chat_id) not in user.get("activity_count", {}):
-            await collection.update_one(
-                {"user_id": user_id},
-                {"$set": {f"activity_count.{chat_id}": 0}}
-            )
         result = await collection.update_one(
             {"user_id": user_id},
             {
@@ -441,6 +497,9 @@ async def increment_activity_count(user_id: int, chat_id: int) -> bool:
 
 async def reset_activity_count(user_id: int, chat_id: int) -> bool:
     """Сбрасывает счетчик активности пользователя в указанном чате."""
+    if not isinstance(chat_id, int) or chat_id >= 0:
+        logger.error(f"Недействительный chat_id: {chat_id}")
+        raise ValueError("chat_id должен быть отрицательным целым числом")
     try:
         collection = await get_user_collection()
         result = await collection.update_one(
@@ -460,18 +519,15 @@ async def reset_activity_count(user_id: int, chat_id: int) -> bool:
 
 async def add_warning(user_id: int, chat_id: int, reason: str, issued_by: int) -> bool:
     """Добавляет предупреждение пользователю в указанном чате."""
+    if not isinstance(chat_id, int) or chat_id >= 0:
+        logger.error(f"Недействительный chat_id: {chat_id}")
+        raise ValueError("chat_id должен быть отрицательным целым числом")
     try:
         collection = await get_user_collection()
         user = await collection.find_one({"user_id": user_id})
         if not user:
             logger.error(f"Пользователь {user_id} не найден для добавления предупреждения в chat_id={chat_id}")
             return False
-        if not isinstance(user.get("warnings"), dict):
-            await collection.update_one(
-                {"user_id": user_id},
-                {"$set": {"warnings": {}}}
-            )
-            logger.info(f"Исправлено поле warnings для user_id={user_id}")
         warning = {
             "reason": reason,
             "issued_by": issued_by,
@@ -496,18 +552,15 @@ async def add_warning(user_id: int, chat_id: int, reason: str, issued_by: int) -
 
 async def clear_warnings(user_id: int, chat_id: int, issued_by: int) -> bool:
     """Очищает предупреждения пользователя в указанном чате."""
+    if not isinstance(chat_id, int) or chat_id >= 0:
+        logger.error(f"Недействительный chat_id: {chat_id}")
+        raise ValueError("chat_id должен быть отрицательным целым числом")
     try:
         collection = await get_user_collection()
         user = await collection.find_one({"user_id": user_id})
         if not user:
             logger.error(f"Пользователь {user_id} не найден для очистки предупреждений в chat_id={chat_id}")
             return False
-        if not isinstance(user.get("warnings"), dict):
-            await collection.update_one(
-                {"user_id": user_id},
-                {"$set": {"warnings": {}}}
-            )
-            logger.info(f"Исправлено поле warnings для user_id={user_id}")
         result = await collection.update_one(
             {"user_id": user_id},
             {
@@ -526,18 +579,15 @@ async def clear_warnings(user_id: int, chat_id: int, issued_by: int) -> bool:
 
 async def ban_user(user_id: int, chat_id: int, reason: str, issued_by: int, duration: float = None) -> bool:
     """Банит пользователя в указанном чате."""
+    if not isinstance(chat_id, int) or chat_id >= 0:
+        logger.error(f"Недействительный chat_id: {chat_id}")
+        raise ValueError("chat_id должен быть отрицательным целым числом")
     try:
         collection = await get_user_collection()
         user = await collection.find_one({"user_id": user_id})
         if not user:
             logger.error(f"Пользователь {user_id} не найден для бана в chat_id={chat_id}")
             return False
-        if not isinstance(user.get("bans"), dict):
-            await collection.update_one(
-                {"user_id": user_id},
-                {"$set": {"bans": {}}}
-            )
-            logger.info(f"Исправлено поле bans для user_id={user_id}")
         ban_info = {
             "is_banned": True,
             "reason": reason,
@@ -563,18 +613,15 @@ async def ban_user(user_id: int, chat_id: int, reason: str, issued_by: int, dura
 
 async def unban_user(user_id: int, chat_id: int, issued_by: int) -> bool:
     """Разбанивает пользователя в указанном чате."""
+    if not isinstance(chat_id, int) or chat_id >= 0:
+        logger.error(f"Недействительный chat_id: {chat_id}")
+        raise ValueError("chat_id должен быть отрицательным целым числом")
     try:
         collection = await get_user_collection()
         user = await collection.find_one({"user_id": user_id})
         if not user:
             logger.error(f"Пользователь {user_id} не найден для разбана в chat_id={chat_id}")
             return False
-        if not isinstance(user.get("bans"), dict):
-            await collection.update_one(
-                {"user_id": user_id},
-                {"$set": {"bans": {}}}
-            )
-            logger.info(f"Исправлено поле bans для user_id={user_id}")
         ban_info = {
             "is_banned": False,
             "reason": "",
@@ -600,18 +647,15 @@ async def unban_user(user_id: int, chat_id: int, issued_by: int) -> bool:
 
 async def mute_user(user_id: int, chat_id: int, duration: float, reason: str, issued_by: int) -> bool:
     """Мутит пользователя в указанном чате на заданное время."""
+    if not isinstance(chat_id, int) or chat_id >= 0:
+        logger.error(f"Недействительный chat_id: {chat_id}")
+        raise ValueError("chat_id должен быть отрицательным целым числом")
     try:
         collection = await get_user_collection()
         user = await collection.find_one({"user_id": user_id})
         if not user:
             logger.error(f"Пользователь {user_id} не найден для мута в chat_id={chat_id}")
             return False
-        if not isinstance(user.get("mutes"), dict):
-            await collection.update_one(
-                {"user_id": user_id},
-                {"$set": {"mutes": {}}}
-            )
-            logger.info(f"Исправлено поле mutes для user_id={user_id}")
         mute_info = {
             "is_muted": True,
             "until": time.time() + duration,
@@ -637,18 +681,15 @@ async def mute_user(user_id: int, chat_id: int, duration: float, reason: str, is
 
 async def unmute_user(user_id: int, chat_id: int, issued_by: int) -> bool:
     """Снимает мут с пользователя в указанном чате."""
+    if not isinstance(chat_id, int) or chat_id >= 0:
+        logger.error(f"Недействительный chat_id: {chat_id}")
+        raise ValueError("chat_id должен быть отрицательным целым числом")
     try:
         collection = await get_user_collection()
         user = await collection.find_one({"user_id": user_id})
         if not user:
             logger.error(f"Пользователь {user_id} не найден для снятия мута в chat_id={chat_id}")
             return False
-        if not isinstance(user.get("mutes"), dict):
-            await collection.update_one(
-                {"user_id": user_id},
-                {"$set": {"mutes": {}}}
-            )
-            logger.info(f"Исправлено поле mutes для user_id={user_id}")
         mute_info = {
             "is_muted": False,
             "until": 0.0,
@@ -674,6 +715,9 @@ async def unmute_user(user_id: int, chat_id: int, issued_by: int) -> bool:
 
 async def kick_user(user_id: int, chat_id: int, reason: str, issued_by: int) -> bool:
     """Логирует исключение пользователя из указанного чата."""
+    if not isinstance(chat_id, int) or chat_id >= 0:
+        logger.error(f"Недействительный chat_id: {chat_id}")
+        raise ValueError("chat_id должен быть отрицательным целым числом")
     try:
         await log_moderation_action(user_id, chat_id, "kick", reason, issued_by)
         logger.info(f"Пользователь {user_id} исключен из chat_id={chat_id}, причина: {reason}, выдано: {issued_by}")
@@ -684,6 +728,12 @@ async def kick_user(user_id: int, chat_id: int, reason: str, issued_by: int) -> 
 
 async def log_moderation_action(user_id: int, chat_id: int, action: str, reason: str, issued_by: int, duration: float = None, until_date: float = None) -> bool:
     """Логирует действие модерации в коллекцию moderation_logs."""
+    if not isinstance(chat_id, int) or chat_id >= 0:
+        logger.error(f"Недействительный chat_id: {chat_id}")
+        raise ValueError("chat_id должен быть отрицательным целым числом")
+    if action not in VALID_MODERATION_ACTIONS:
+        logger.error(f"Недействительное действие модерации: {action}")
+        raise ValueError(f"Действие модерации должно быть одним из: {VALID_MODERATION_ACTIONS}")
     try:
         collection = await get_moderation_logs_collection()
         log_entry = {
@@ -705,6 +755,9 @@ async def log_moderation_action(user_id: int, chat_id: int, action: str, reason:
 
 async def get_moderation_logs(chat_id: int, limit: int = 10) -> List[Dict]:
     """Получает последние логи модерации для указанного чата."""
+    if not isinstance(chat_id, int) or chat_id >= 0:
+        logger.error(f"Недействительный chat_id: {chat_id}")
+        raise ValueError("chat_id должен быть отрицательным целым числом")
     try:
         collection = await get_moderation_logs_collection()
         cursor = collection.find({"chat_id": chat_id}).sort("issued_at", -1).limit(limit)
@@ -717,6 +770,9 @@ async def get_moderation_logs(chat_id: int, limit: int = 10) -> List[Dict]:
 
 async def set_server_owner(user_id: int, chat_id: int) -> bool:
     """Назначает пользователя владельцем сервера для указанного чата."""
+    if not isinstance(chat_id, int) or chat_id >= 0:
+        logger.error(f"Недействительный chat_id: {chat_id}")
+        raise ValueError("chat_id должен быть отрицательным целым числом")
     collection = await get_user_collection()
     user = await get_user(user_id, create_if_not_exists=True, chat_id=chat_id)
     if user.user_id == OWNER_BOT_ID:
@@ -737,6 +793,9 @@ async def set_server_owner(user_id: int, chat_id: int) -> bool:
 
 async def remove_server_owner(user_id: int, chat_id: int) -> bool:
     """Удаляет роль владельца сервера для указанного чата."""
+    if not isinstance(chat_id, int) or chat_id >= 0:
+        logger.error(f"Недействительный chat_id: {chat_id}")
+        raise ValueError("chat_id должен быть отрицательным целым числом")
     collection = await get_user_collection()
     user = await get_user(user_id, create_if_not_exists=False)
     if not user:
@@ -760,6 +819,9 @@ async def remove_server_owner(user_id: int, chat_id: int) -> bool:
 
 async def register_chat_member(user_id: int, username: str, display_name: str, chat_id: int, is_bot: bool = False) -> User:
     """Регистрирует участника чата в базе данных или обновляет его данные."""
+    if not isinstance(chat_id, int) or chat_id >= 0:
+        logger.error(f"Недействительный chat_id: {chat_id}")
+        raise ValueError("chat_id должен быть отрицательным целым числом")
     try:
         user = await get_user(user_id, create_if_not_exists=False, chat_id=chat_id)
         updates = {
@@ -768,55 +830,40 @@ async def register_chat_member(user_id: int, username: str, display_name: str, c
             "is_bot": is_bot,
             "group_ids": user.group_ids + [chat_id] if chat_id not in user.group_ids else user.group_ids
         }
-        if str(chat_id) not in user.activity_count:
-            updates[f"activity_count.{chat_id}"] = 0
-        if str(chat_id) not in user.warnings:
-            updates[f"warnings.{chat_id}"] = []
-        if str(chat_id) not in user.bans:
-            updates[f"bans.{chat_id}"] = {"is_banned": False, "reason": "", "issued_by": 0, "issued_at": 0.0, "until": 0.0}
-        if str(chat_id) not in user.mutes:
-            updates[f"mutes.{chat_id}"] = {"is_muted": False, "until": 0.0, "reason": "", "issued_by": 0, "issued_at": 0.0}
         await update_user(user_id, updates)
         logger.info(f"Обновлен пользователь {user_id} для chat_id={chat_id}, is_bot={is_bot}")
         return await get_user(user_id, chat_id=chat_id)
     except ValueError:
         role_level = 7 if user_id == OWNER_BOT_ID else 0
-        activity_count = {str(chat_id): 0}
-        warnings = {str(chat_id): []}
-        bans = {str(chat_id): {"is_banned": False, "reason": "", "issued_by": 0, "issued_at": 0.0, "until": 0.0}}
-        mutes = {str(chat_id): {"is_muted": False, "until": 0.0, "reason": "", "issued_by": 0, "issued_at": 0.0}}
-        known_chats = await get_known_chats()
-        for known_chat_id in known_chats:
-            activity_count[str(known_chat_id)] = 0
-            warnings[str(known_chat_id)] = []
-            bans[str(known_chat_id)] = {"is_banned": False, "reason": "", "issued_by": 0, "issued_at": 0.0, "until": 0.0}
-            mutes[str(known_chat_id)] = {"is_muted": False, "until": 0.0, "reason": "", "issued_by": 0, "issued_at": 0.0}
         user = User(
             user_id=user_id,
             username=username,
             display_name=display_name,
             group_ids=[chat_id],
             role_level=role_level,
-            is_bot=is_bot,
-            activity_count=activity_count,
-            warnings=warnings,
-            bans=bans,
-            mutes=mutes
+            is_bot=is_bot
         )
         return await create_user(user, chat_id=chat_id)
 
 async def delete_user(user_id: int) -> bool:
     """Удаляет пользователя из базы данных."""
-    collection = await get_user_collection()
-    result = await collection.delete_one({"user_id": user_id})
-    if result.deleted_count > 0:
-        logger.info(f"Удален пользователь: {user_id}")
-        return True
-    logger.warning(f"Пользователь не найден для удаления: {user_id}")
-    return False
+    try:
+        collection = await get_user_collection()
+        result = await collection.delete_one({"user_id": user_id})
+        if result.deleted_count > 0:
+            logger.info(f"Удален пользователь: {user_id}")
+            return True
+        logger.warning(f"Пользователь не найден для удаления: {user_id}")
+        return False
+    except Exception as e:
+        logger.error(f"Ошибка при удалении пользователя {user_id}: {str(e)}")
+        return False
 
 async def save_chat(chat_id: int, chat_title: str = None) -> bool:
     """Сохраняет chat_id в коллекцию chats."""
+    if not isinstance(chat_id, int) or chat_id >= 0:
+        logger.error(f"Недействительный chat_id: {chat_id}")
+        raise ValueError("chat_id должен быть отрицательным целым числом")
     collection = await get_chat_collection()
     try:
         result = await collection.update_one(
@@ -845,10 +892,17 @@ async def save_chat(chat_id: int, chat_title: str = None) -> bool:
         logger.error(f"Ошибка при сохранении чата chat_id={chat_id}: {str(e)}")
         return False
 
+@cached(ttl=3600)
 async def get_known_chats() -> List[int]:
     """Получает список известных chat_id из коллекции chats."""
-    collection = await get_chat_collection()
-    cursor = collection.find({})
-    chats = [doc["chat_id"] async for doc in cursor]
-    logger.info(f"Найдено {len(chats)} известных чатов: {chats}")
-    return chats
+    try:
+        collection = await get_chat_collection()
+        cursor = collection.find({})
+        chats = [doc["chat_id"] async for doc in cursor]
+        logger.info(f"Найдено {len(chats)} известных чатов: {chats}")
+        return chats
+    except Exception as e:
+        logger.error(f"Ошибка при получении списка чатов: {str(e)}")
+        return []
+
+

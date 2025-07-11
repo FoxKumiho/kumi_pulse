@@ -1,5 +1,6 @@
 import random
 
+
 class Player:
     BASE_EXP = 100
     POWER = 2
@@ -164,7 +165,7 @@ def quicksort(arr):
 print(quicksort([3,4,5,10,1,3,2,1]))
 
 def __dir__():
-    return 
+    return
 
 print(f"привет")
 
@@ -175,5 +176,3 @@ b = int(numbers_as_strings[1])
 sum_result = a + b
 print(sum_result)
 
-
-print(('up', 3)

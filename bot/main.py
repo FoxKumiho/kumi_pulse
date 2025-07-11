@@ -42,13 +42,9 @@ logger.debug(f"Updated sys.path: {sys.path}")
 # Импорты
 try:
     logger.debug("Importing MongoClient and handlers...")
-    from bot.modules.no_sql.user_db import init_user_collection, get_known_chats
-    try:
-        from bot.modules.no_sql.user_db import init_moderation_logs_collection
-    except ImportError as e:
-        logger.error(f"Не удалось импортировать init_moderation_logs_collection: {e}. Убедитесь, что функция добавлена в user_db.py")
-        sys.exit(1)
-    from bot.handlers import start, admin, common, moderation
+    from bot.modules.no_sql.user_db import init_user_collection, init_moderation_logs_collection, get_known_chats
+    from bot.modules.no_sql.redis_client import redis_client
+    from bot.handlers import start, admin, common, moderation, antispam
     from bot.handlers.common import register_all_chat_members
     logger.debug("Imports successful")
 except ImportError as e:
@@ -66,15 +62,15 @@ logger.debug("Loading environment variables from .env...")
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), '..', 'config', '.env'))
 
 API_TOKEN = os.getenv("BOT_TOKEN")
-MONGODB_URI = os.getenv("MONGODB_URI")
+MONGO_URI = os.getenv("MONGO_URI")
 if not API_TOKEN:
     logger.error("BOT_TOKEN не найден в переменных окружения!")
     sys.exit(1)
-if not MONGODB_URI:
-    logger.error("MONGODB_URI не найден в переменных окружения!")
+if not MONGO_URI:
+    logger.error("MONGO_URI не найден в переменных окружения!")
     sys.exit(1)
 logger.debug(f"BOT_TOKEN loaded successfully: {API_TOKEN[:10]}...")
-logger.debug(f"MONGODB_URI loaded: {MONGODB_URI}")
+logger.debug(f"MONGO_URI loaded: {MONGO_URI}")
 
 # Инициализация бота и диспетчера
 logger.debug("Initializing Bot and Dispatcher...")
@@ -91,9 +87,10 @@ try:
     logger.debug("Registering routers...")
     dp.include_router(start.router)
     dp.include_router(admin.router)
-    dp.include_router(common.router)
     dp.include_router(moderation.router)
-    logger.info("Routers registered successfully: start, admin, common, moderation")
+    dp.include_router(common.router)
+    dp.include_router(antispam.router)  # Антиспам регистрируется последним
+    logger.info("Routers registered successfully: start, admin, moderation, common, antispam")
 except AttributeError as e:
     logger.error(f"Ошибка при регистрации маршрутизаторов: {e}")
     sys.exit(1)
@@ -105,12 +102,8 @@ async def lifespan():
         # Инициализация MongoDB
         logger.debug("Starting MongoClient initialization...")
         await init_user_collection()
-        try:
-            await init_moderation_logs_collection()
-            logger.info("MongoDB collections initialized: users, moderation_logs")
-        except Exception as e:
-            logger.error(f"Ошибка при инициализации moderation_logs: {e}")
-            raise
+        await init_moderation_logs_collection()
+        logger.info("MongoDB collections initialized: users, moderation_logs")
         # Проверка работы бота
         logger.debug("Checking bot availability with get_me...")
         bot_info = await bot.get_me()
